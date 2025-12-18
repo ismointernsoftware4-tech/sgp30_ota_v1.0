@@ -2,7 +2,6 @@
 #include <Firebase_ESP_Client.h>
 #include <HTTPClient.h>
 #include <Update.h>
-#include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_SGP30.h>
 #include <Adafruit_BME680.h>
@@ -14,20 +13,21 @@
 #define WIFI_SSID "The King 2.5 GHz"
 #define WIFI_PASSWORD "1234567891"
 
-// Firebase configuration (using the sensor data database)
-#define FIREBASE_HOST "https://ota-check-ab802-default-rtdb.asia-southeast1.firebasedatabase.app"
+// Firebase configuration
+#define FIREBASE_HOST "https://ota-check-ab802-default-rtdb.asia-southeast1.firebasedatabase.app/"
 #define FIREBASE_AUTH "qHVez2jS7dwaxRH2lgCyi8HnyqCaL39i3qvoGakO"
 
-// Firmware version of THIS build
-#define FW_VERSION "1.0"
+// Current firmware version - UPDATE THIS WHEN RELEASING NEW VERSION
+#define FW_VERSION "1.3"
 
 // Timezone settings
 #define NTP_SERVER "pool.ntp.org"
-#define GMT_OFFSET_SEC 19800      // 5 hrs 30 mins = 19800 sec
+#define GMT_OFFSET_SEC 19800      // 5 hrs 30 mins = 19800 sec (IST)
 #define DAYLIGHT_OFFSET_SEC 0
 
-// OTA check interval (in milliseconds) - check every 1 hour
-#define OTA_CHECK_INTERVAL 60000
+// Timing intervals
+#define SENSOR_READ_INTERVAL 5000      // 5 seconds
+#define OTA_CHECK_INTERVAL 60000     // 1 min (check for updates)
 
 /* ========================================== */
 
@@ -36,36 +36,30 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// Preferences (Flash storage)
-Preferences prefs;
-
 // Sensors
 Adafruit_SGP30 sgp;
 Adafruit_BME680 bme;
 
 // Timing variables
-unsigned long lastOTACheck = 0;
 unsigned long lastSensorRead = 0;
-#define SENSOR_READ_INTERVAL 5000  // Read sensors every 5 seconds
+unsigned long lastOTACheck = 0;
 
 // Function declarations
 String getTimeStamp();
-void checkForFirmwareUpdate();
-void performOTA(String firmwareURL, String latestVersion);
+String getDateStamp();
 void readAndUploadSensorData();
+void checkForFirmwareUpdate();
+void performOTA(String firmwareURL);
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
 
-  // Init preferences
-  prefs.begin("ota", false);
+  Serial.println("====================================");
+  Serial.println("Booting firmware v" FW_VERSION);
+  Serial.println("====================================");
 
-  // Read stored version
-  String installedVersion = prefs.getString("version", FW_VERSION);
-  Serial.println("Booting firmware v" + installedVersion);
-
-  // WiFi connect
+  // Connect to WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -73,8 +67,10 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nWiFi Connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 
-  // Configure time
+  // Configure NTP time
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
   Serial.println("Waiting for time...");
   struct tm timeinfo;
@@ -84,33 +80,36 @@ void setup() {
   }
   Serial.println("\nTime synchronized");
 
-  // Firebase init
+  // Initialize Firebase
   config.database_url = FIREBASE_HOST;
   if (strlen(FIREBASE_AUTH) > 0) {
     config.signer.tokens.legacy_token = FIREBASE_AUTH;
   }
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
+  Serial.println("Firebase initialized");
 
-  // Initialize SGP30
+  // Initialize SGP30 sensor
   if (!sgp.begin()) {
     Serial.println("SGP30 not found");
-    while (1) delay(10);
+    while (1);
   }
-  Serial.println("SGP30 initialized");
+  Serial.println("SGP30 sensor initialized");
 
-  // Initialize BME680
+  // Initialize BME680 sensor
   if (!bme.begin(0x76)) {
     Serial.println("BME680 not found");
-    while (1) delay(10);
+    while (1);
   }
   bme.setTemperatureOversampling(BME680_OS_8X);
   bme.setHumidityOversampling(BME680_OS_2X);
   bme.setPressureOversampling(BME680_OS_4X);
   bme.setGasHeater(320, 150);
-  Serial.println("BME680 initialized");
+  Serial.println("BME680 sensor initialized");
 
-  Serial.println("All sensors ready");
+  Serial.println("====================================");
+  Serial.println("All sensors ready!");
+  Serial.println("====================================\n");
 
   // Check for firmware update at startup
   checkForFirmwareUpdate();
@@ -119,16 +118,16 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Check for OTA update periodically
-  if (currentMillis - lastOTACheck >= OTA_CHECK_INTERVAL) {
-    lastOTACheck = currentMillis;
-    checkForFirmwareUpdate();
-  }
-
-  // Read and upload sensor data
+  // Read and upload sensor data every SENSOR_READ_INTERVAL
   if (currentMillis - lastSensorRead >= SENSOR_READ_INTERVAL) {
     lastSensorRead = currentMillis;
     readAndUploadSensorData();
+  }
+
+  // Check for OTA updates every OTA_CHECK_INTERVAL
+  if (currentMillis - lastOTACheck >= OTA_CHECK_INTERVAL) {
+    lastOTACheck = currentMillis;
+    checkForFirmwareUpdate();
   }
 
   delay(100);  // Small delay to prevent watchdog issues
@@ -147,50 +146,63 @@ String getTimeStamp() {
   return String(buffer);
 }
 
+String getDateStamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "date_error";
+  }
+
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo); // YYYY-MM-DD format
+  return String(buffer);
+}
+
 /* ================= SENSOR FUNCTIONS ================= */
 
 void readAndUploadSensorData() {
   // Read sensors
-  if (!sgp.IAQmeasure()) {
-    Serial.println("SGP30 measurement failed");
-    return;
-  }
+  sgp.IAQmeasure();
+  bme.performReading();
 
-  if (!bme.performReading()) {
-    Serial.println("BME680 reading failed");
-    return;
-  }
-
-  // Get timestamp
-  String timestamp = getTimeStamp();
-  if (timestamp == "time_error") {
-    Serial.println("Time not available");
-    return;
-  }
-
-  // Replace colons with underscores for Firebase path
-  timestamp.replace(":", "_");
-
-  // Create JSON object using Firebase JSON
-  FirebaseJson json;
-  json.set("TVOC", sgp.TVOC);
-  json.set("eCO2", sgp.eCO2);
-  json.set("Temperature", bme.temperature);
-  json.set("Humidity", bme.humidity);
-  json.set("Pressure", bme.pressure / 100.0);
-  json.set("Gas", bme.gas_resistance / 1000.0);
-
-  // Upload to Firebase
-  String path = "/History/" + timestamp;
+  // Get date and time
+  String date = getDateStamp();
+  String time = getTimeStamp();
   
-  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
-    Serial.println("Sensor data uploaded: " + timestamp);
-    Serial.printf("TVOC: %d ppb, eCO2: %d ppm, Temp: %.2f°C, Hum: %.2f%%\n", 
-                  sgp.TVOC, sgp.eCO2, bme.temperature, bme.humidity);
-  } else {
-    Serial.println("Failed to upload sensor data");
-    Serial.println("Reason: " + fbdo.errorReason());
+  if (date == "date_error" || time == "time_error") {
+    Serial.println("Time not available, skipping upload");
+    return;
   }
+
+  // Create JSON payload
+  String jsonData = "{";
+  jsonData += "\"TVOC\":" + String(sgp.TVOC) + ",";
+  jsonData += "\"eCO2\":" + String(sgp.eCO2) + ",";
+  jsonData += "\"Temperature\":" + String(bme.temperature) + ",";
+  jsonData += "\"Humidity\":" + String(bme.humidity) + ",";
+  jsonData += "\"Pressure\":" + String(bme.pressure / 100.0) + ",";
+  jsonData += "\"Gas\":" + String(bme.gas_resistance / 1000.0) + ",";
+  jsonData += "\"Date\":\"" + date + "\",";
+  jsonData += "\"Time\":\"" + time + "\"";
+  jsonData += "}";
+
+  // Send to Firebase using HTTP PUT
+  HTTPClient http;
+  String timestamp = time;
+  timestamp.replace(":", "_");
+  String url = String(FIREBASE_HOST) + "History/" + date + "/" + timestamp + ".json";
+
+  http.begin(url);
+  int httpCode = http.PUT(jsonData);
+
+  Serial.print("Firebase response: ");
+  Serial.println(httpCode);
+  
+  if (httpCode == 200) {
+    Serial.printf("[%s %s] TVOC: %d ppb | eCO2: %d ppm | Temp: %.2f°C | Hum: %.2f%%\n",
+                  date.c_str(), time.c_str(), sgp.TVOC, sgp.eCO2, bme.temperature, bme.humidity);
+  }
+
+  http.end();
 }
 
 /* ================= OTA FUNCTIONS ================= */
@@ -198,47 +210,50 @@ void readAndUploadSensorData() {
 void checkForFirmwareUpdate() {
   Serial.println("Checking Firebase for latest firmware...");
 
+  // Read latest firmware version from Firebase
   if (!Firebase.RTDB.getString(&fbdo, "/ota/version")) {
-    Serial.println("Failed to read OTA version");
-    Serial.println("Reason: " + fbdo.errorReason());
+    Serial.printf("Failed to get version: %s\n", fbdo.errorReason().c_str());
     return;
   }
-
+  
   String latestVersion = fbdo.stringData();
-  String installedVersion = prefs.getString("version", FW_VERSION);
+  Serial.println("Latest version on Firebase: " + latestVersion);
 
-  Serial.println("Installed Version: " + installedVersion);
-  Serial.println("Latest Version: " + latestVersion);
-
-  if (installedVersion == latestVersion) {
+  // Compare with current firmware version
+  if (String(FW_VERSION) == latestVersion) {
     Serial.println("Firmware is already up to date.");
     return;
   }
 
-  Serial.println("New firmware available!");
+  Serial.println("*** NEW FIRMWARE AVAILABLE ***");
+  Serial.println("Current version: " FW_VERSION);
+  Serial.println("New version: " + latestVersion);
 
+  // Get firmware URL from Firebase
   if (!Firebase.RTDB.getString(&fbdo, "/ota/url")) {
-    Serial.println("Failed to read firmware URL");
-    Serial.println("Reason: " + fbdo.errorReason());
+    Serial.printf("Failed to get URL: %s\n", fbdo.errorReason().c_str());
     return;
   }
-
+  
   String firmwareURL = fbdo.stringData();
   Serial.println("Firmware URL: " + firmwareURL);
 
-  performOTA(firmwareURL, latestVersion);
+  // Perform OTA update
+  performOTA(firmwareURL);
 }
 
-void performOTA(String firmwareURL, String latestVersion) {
-  Serial.println("Starting OTA update...");
-  Serial.println("This may take a few minutes. Do not power off the device!");
+void performOTA(String firmwareURL) {
+  Serial.println("\n========================================");
+  Serial.println("STARTING OTA UPDATE");
+  Serial.println("DO NOT POWER OFF THE DEVICE!");
+  Serial.println("========================================\n");
 
   HTTPClient http;
   http.begin(firmwareURL);
-
+  
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("HTTP Error: %d\n", httpCode);
+    Serial.printf("Failed to download firmware, HTTP code: %d\n", httpCode);
     http.end();
     return;
   }
@@ -254,43 +269,24 @@ void performOTA(String firmwareURL, String latestVersion) {
 
   if (!Update.begin(contentLength)) {
     Serial.println("Not enough space for OTA");
-    Serial.printf("Available: %d bytes\n", ESP.getFreeSketchSpace());
     http.end();
     return;
   }
 
+  Serial.println("Downloading and flashing firmware...");
   WiFiClient* stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
 
-  if (written == contentLength) {
-    Serial.println("Written : " + String(written) + " successfully");
+  if (written == contentLength && Update.end()) {
+    Serial.println("\n========================================");
+    Serial.println("OTA SUCCESS!");
+    Serial.println("========================================");
+    Serial.println("Rebooting in 3 seconds...");
+    delay(3000);
+    ESP.restart();
   } else {
-    Serial.println("Written only : " + String(written) + "/" + String(contentLength));
-  }
-
-  if (Update.end()) {
-    Serial.println("OTA done!");
-    if (Update.isFinished()) {
-      Serial.println("Update successfully completed!");
-
-      // Save new version in flash
-      prefs.putString("version", latestVersion);
-      Serial.println("Stored new version: " + latestVersion);
-
-      // Optional: Update Firebase to confirm successful OTA
-      FirebaseJson json;
-      json.set("last_update", latestVersion);
-      json.set("status", "success");
-      Firebase.RTDB.setJSON(&fbdo, "/ota/last_update_status", &json);
-
-      Serial.println("Rebooting in 3 seconds...");
-      delay(3000);
-      ESP.restart();
-    } else {
-      Serial.println("Update not finished? Something went wrong!");
-    }
-  } else {
-    Serial.println("OTA Error Occurred. Error #: " + String(Update.getError()));
+    Serial.println("OTA Failed");
+    Update.printError(Serial);
     Update.abort();
   }
 
